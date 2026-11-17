@@ -16,6 +16,7 @@ bytes = "1.4"
 indexmap = "2"
 rand = "0.9"
 rand_distr = "0.5"
+scoped-tls = "1.0.1"
 tokio = { version = "1.25.0", features = ["fs", "io-util", "sync", "time"] }
 tracing = "0.1"
 

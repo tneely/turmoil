@@ -26,77 +26,21 @@
 //! ```
 
 use crate::shim::std::fs as sync_fs;
-use crate::FsContext;
-use rand::RngCore;
+use crate::{Access, FsContext, FsState};
 use std::io::Result;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
+use std::time::Duration;
+
+async fn delay(latency: Duration) {
+    if !latency.is_zero() {
+        tokio::time::sleep(latency).await;
+    }
+}
 
 /// Apply I/O latency if configured (assumes cache miss).
-///
-/// This uses tokio's simulated time, so it doesn't slow down tests.
 async fn apply_io_latency() {
-    let latency = FsContext::current(|ctx| ctx.fs.calculate_latency(false));
-    if !latency.is_zero() {
-        tokio::time::sleep(latency).await;
-    }
-}
-
-/// Apply I/O latency for a file read operation, checking page cache.
-///
-/// - Checks if the page is cached (returns cache hit = fast latency)
-/// - Inserts the page into cache after read (if not direct_io)
-/// - Direct I/O always bypasses cache
-async fn apply_read_latency(path: &Path, offset: u64, direct_io: bool) {
-    let latency = FsContext::current(|ctx| {
-        let cache_hit = if !direct_io {
-            // Split-borrow: cache.access wants `&mut self.rng` but we
-            // already have `&mut self.page_cache`. The two are
-            // disjoint fields on `Fs`; pull rng out via raw pointer.
-            // SAFETY: single-threaded sim; rng and page_cache are
-            // distinct fields, so no aliasing.
-            let rng_ptr: *mut dyn RngCore = &mut *ctx.fs.rng;
-            if let Some(cache) = &mut ctx.fs.page_cache {
-                let rng = unsafe { &mut *rng_ptr };
-                let hit = cache.access(path, offset, rng);
-                // Insert into cache after read (even on hit, to update LRU)
-                cache.insert(path, offset);
-                hit
-            } else {
-                false
-            }
-        } else {
-            false // O_DIRECT always misses cache
-        };
-
-        ctx.fs.calculate_latency(cache_hit)
-    });
-
-    if !latency.is_zero() {
-        tokio::time::sleep(latency).await;
-    }
-}
-
-/// Apply I/O latency for a file write operation, populating page cache.
-///
-/// - Writes always populate the cache (write-through)
-/// - Direct I/O bypasses cache entirely
-async fn apply_write_latency(path: &Path, offset: u64, direct_io: bool) {
-    let latency = FsContext::current(|ctx| {
-        // Writes are always cache misses (data goes to disk)
-        // but we populate the cache for subsequent reads
-        if !direct_io {
-            if let Some(cache) = &mut ctx.fs.page_cache {
-                cache.insert(path, offset);
-            }
-        }
-
-        // Writes always incur full latency (write-through to disk)
-        ctx.fs.calculate_latency(false)
-    });
-
-    if !latency.is_zero() {
-        tokio::time::sleep(latency).await;
-    }
+    delay(FsContext::current(|ctx| ctx.fs.calculate_latency(false))).await;
 }
 
 // Re-export types that are the same
@@ -323,17 +267,8 @@ impl File {
     /// This operation incurs I/O latency if configured. If page cache is enabled,
     /// cache hits result in near-instant reads.
     pub async fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
-        use std::os::unix::fs::FileExt;
-        let result = self.inner.read_at(buf, offset);
-
-        // Apply cache-aware latency
-        if let Some(path) = self.inner.path() {
-            apply_read_latency(&path, offset, self.inner.is_direct_io()).await;
-        } else {
-            apply_io_latency().await;
-        }
-
-        result
+        self.transfer(offset, Access::Read, |fs, fd| fs.read_at(fd, buf, offset))
+            .await
     }
 
     /// Writes bytes to the file at the specified offset.
@@ -341,16 +276,27 @@ impl File {
     /// This operation incurs I/O latency if configured. Writes populate
     /// the page cache for subsequent reads.
     pub async fn write_at(&self, buf: &[u8], offset: u64) -> Result<usize> {
-        use std::os::unix::fs::FileExt;
-        let result = self.inner.write_at(buf, offset);
+        self.transfer(offset, Access::Write, |fs, fd| fs.write_at(fd, buf, offset))
+            .await
+    }
 
-        // Apply cache-aware latency (writes populate cache)
-        if let Some(path) = self.inner.path() {
-            apply_write_latency(&path, offset, self.inner.is_direct_io()).await;
-        } else {
-            apply_io_latency().await;
-        }
-
+    async fn transfer(
+        &self,
+        offset: u64,
+        access: Access,
+        op: impl FnOnce(&mut FsState, RawFd) -> Result<usize>,
+    ) -> Result<usize> {
+        let fd = self.as_raw_fd();
+        let (result, latency) = self.inner.context(|ctx| {
+            let result = op(ctx.fs, fd);
+            let latency = match (&result, access) {
+                (Ok(1..), Access::Read) => ctx.fs.read_latency(fd, offset),
+                (Ok(1..), Access::Write) => ctx.fs.write_latency(fd, offset),
+                _ => ctx.fs.calculate_latency(false),
+            };
+            Ok((result, latency))
+        })?;
+        delay(latency).await;
         result
     }
 }

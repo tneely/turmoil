@@ -1,7 +1,8 @@
 //! Symlink and hard link tests.
 
+use std::os::unix::fs::{FileExt, MetadataExt};
 use turmoil::fs::shim::std::fs::{
-    canonicalize, create_dir, hard_link, metadata, read, symlink, write,
+    canonicalize, create_dir, hard_link, metadata, read, remove_file, symlink, write, OpenOptions,
 };
 use turmoil::{Builder, Result};
 
@@ -235,6 +236,26 @@ fn symlink_chain_limit() -> Result {
         let result = canonicalize("/chain3")?;
         assert_eq!(result, std::path::PathBuf::from("/data/file.txt"));
 
+        Ok(())
+    });
+    sim.run()
+}
+
+#[test]
+fn hard_links_share_one_file() -> Result {
+    let mut sim = Builder::new().build();
+    sim.client("test", async {
+        write("/a", b"AAAA")?;
+        hard_link("/a", "/b")?;
+        assert_eq!(metadata("/a")?.ino(), metadata("/b")?.ino());
+
+        let file = OpenOptions::new().write(true).open("/b")?;
+        file.write_all_at(b"ZZ", 0)?;
+        assert_eq!(read("/a")?, b"ZZAA");
+
+        remove_file("/a")?;
+        assert_eq!(read("/b")?, b"ZZAA");
+        assert_eq!(metadata("/b")?.nlink(), 1);
         Ok(())
     });
     sim.run()

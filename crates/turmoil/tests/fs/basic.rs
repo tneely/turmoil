@@ -1,12 +1,20 @@
 //! Basic file operation tests.
 
-use std::os::unix::fs::FileExt;
+use std::io::{ErrorKind, Seek, SeekFrom};
+use std::os::unix::fs::{FileExt, MetadataExt};
 use turmoil::fs::shim::std::fs::{
-    copy, create_dir, create_dir_all, read, read_to_string, write, OpenOptions,
+    copy, create_dir, create_dir_all, read, read_to_string, remove_file, rename, write, File,
+    OpenOptions,
 };
+use turmoil::fs::Fs;
 use turmoil::{Builder, Result};
 
 const TEST_PATH: &str = "/test/data.db";
+
+fn open_rw(path: &str) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).open(path)
+}
 
 #[test]
 fn basic_read_write() -> Result {
@@ -420,4 +428,177 @@ fn as_raw_fd_isolated_per_host() -> Result {
         Ok(())
     });
     sim.run()
+}
+
+#[test]
+fn truncate_then_extend_reads_zeros() -> Result {
+    let mut sim = Builder::new().build();
+    sim.client("test", async {
+        let file = open_rw("/file")?;
+        file.write_all_at(b"hello world", 0)?;
+        file.set_len(0)?;
+        file.set_len(11)?;
+        let mut buf = [0xffu8; 11];
+        file.read_exact_at(&mut buf, 0)?;
+        assert_eq!(buf, [0u8; 11]);
+        Ok(())
+    });
+    sim.run()
+}
+
+#[test]
+fn open_file_follows_rename() -> Result {
+    let mut sim = Builder::new().build();
+    sim.client("test", async {
+        let file = open_rw("/old")?;
+        file.write_all_at(b"abc", 0)?;
+        rename("/old", "/new")?;
+
+        file.write_all_at(b"def", 3)?;
+        file.sync_all()?;
+        assert_eq!(read("/new")?, b"abcdef");
+
+        let renamed = OpenOptions::new().write(true).open("/new")?;
+        renamed.write_all_at(b"ghi", 6)?;
+        let mut buf = [0u8; 9];
+        file.read_exact_at(&mut buf, 0)?;
+        assert_eq!(&buf, b"abcdefghi");
+        Ok(())
+    });
+    sim.run()
+}
+
+#[test]
+fn removed_file_lives_on_through_open_handle() -> Result {
+    let mut sim = Builder::new().build();
+    sim.client("test", async {
+        let old = open_rw("/file")?;
+        old.write_all_at(b"old", 0)?;
+        remove_file("/file")?;
+
+        let new = OpenOptions::new().write(true).create(true).open("/file")?;
+        new.write_all_at(b"N", 0)?;
+
+        let mut buf = [0u8; 3];
+        old.read_exact_at(&mut buf, 0)?;
+        assert_eq!(&buf, b"old");
+        assert_eq!(old.metadata()?.nlink(), 0);
+        assert_eq!(read("/file")?, b"N");
+        Ok(())
+    });
+    sim.run()
+}
+
+#[test]
+fn preallocated_space_reads_as_zeros() -> Result {
+    let mut sim = Builder::new().build();
+    sim.client("test", async {
+        let file = open_rw("/wal")?;
+        // Far more than fits in memory, were it stored.
+        file.set_len(1 << 40)?;
+        file.sync_all()?;
+        assert_eq!(file.metadata()?.blocks(), 0);
+        file.write_all_at(b"head", 0)?;
+        file.write_all_at(b"x", 4096)?;
+        assert_eq!(file.metadata()?.blocks(), 2);
+        let mut tail = [0xffu8; 8];
+        file.read_exact_at(&mut tail, (1 << 40) - 8)?;
+        assert_eq!(tail, [0u8; 8]);
+        assert_eq!(file.metadata()?.len(), 1 << 40);
+        Ok(())
+    });
+    sim.run()
+}
+
+/// A write far into a file stores what was written, not the hole before it.
+#[test]
+fn write_at_the_end_of_a_sparse_file() -> Result {
+    let mut sim = Builder::new().build();
+    sim.client("test", async {
+        let mut file = open_rw("/wal")?;
+        file.set_len(1 << 40)?;
+        file.write_all_at(b"tail", (1 << 40) - 4)?;
+        file.sync_all()?;
+        let mut tail = [0xffu8; 8];
+        file.read_exact_at(&mut tail, (1 << 40) - 8)?;
+        assert_eq!(&tail, b"\0\0\0\0tail");
+
+        let max_len = i64::MAX as u64;
+        file.write_all_at(b"x", max_len - 1)?;
+        let mut byte = [0u8; 1];
+        file.read_exact_at(&mut byte, max_len - 1)?;
+        assert_eq!(&byte, b"x");
+        assert_eq!(file.seek(SeekFrom::End(0))?, max_len);
+        let invalid = file.seek(SeekFrom::Current(1)).unwrap_err();
+        assert_eq!(invalid.kind(), ErrorKind::InvalidInput);
+        for len in [max_len + 1, u64::MAX] {
+            assert_eq!(
+                file.set_len(len).unwrap_err().kind(),
+                ErrorKind::FileTooLarge
+            );
+        }
+        let too_big = file.write_at(b"x", max_len).unwrap_err();
+        assert_eq!(too_big.kind(), ErrorKind::FileTooLarge);
+        assert_eq!(file.stream_position()?, max_len);
+        assert_eq!(file.metadata()?.len(), max_len);
+        Ok(())
+    });
+    sim.run()
+}
+
+/// A file belongs to the filesystem it was opened on. On another one its
+/// descriptor names nothing, rather than whatever has the same number there.
+#[test]
+fn file_does_not_reach_into_another_filesystem() -> std::io::Result<()> {
+    let (ours, theirs) = (Fs::builder().build(), Fs::builder().build());
+    let on_ours = ours.enter();
+    let (mut file, other) = (open_rw("/file")?, open_rw("/other")?);
+    file.write_all_at(b"ours", 0)?;
+    drop(on_ours);
+
+    // The first descriptor has the same number on either filesystem.
+    let on_theirs = theirs.enter();
+    let same_number = open_rw("/file")?;
+    same_number.write_all_at(b"theirs", 0)?;
+    let stale = [
+        file.read_at(&mut [0; 4], 0).map(drop),
+        file.write_at(b"lost", 0).map(drop),
+        file.set_len(0),
+        file.sync_all(),
+        file.try_clone().map(drop),
+        file.seek(SeekFrom::Start(2)).map(drop),
+        file.seek(SeekFrom::Current(1)).map(drop),
+    ];
+    for result in stale {
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::NotFound);
+    }
+    assert_eq!(read("/file")?, b"theirs");
+    drop(on_theirs);
+
+    let _on_ours = ours.enter();
+    assert_eq!(file.stream_position()?, 0);
+    assert_eq!(read("/file")?, b"ours");
+    assert_eq!(other.metadata()?.len(), 0);
+    ours.close_all();
+    for pos in [SeekFrom::Start(1), SeekFrom::Current(1), SeekFrom::End(0)] {
+        assert_eq!(file.seek(pos).unwrap_err().kind(), ErrorKind::NotFound);
+    }
+    Ok(())
+}
+
+#[test]
+fn file_handle_can_outlive_the_host() -> std::io::Result<()> {
+    use std::sync::{Arc, Mutex};
+    use turmoil::fs::{enter, FsState};
+
+    let state = Arc::new(Mutex::new(FsState::default()));
+    let owner = Arc::downgrade(&state);
+    let file = {
+        let _entered = enter(&state);
+        File::create("/file")?
+    };
+    drop(state);
+    assert!(owner.upgrade().is_none());
+    drop(file);
+    Ok(())
 }
